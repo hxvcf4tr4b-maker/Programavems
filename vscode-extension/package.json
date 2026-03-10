@@ -1,0 +1,76 @@
+{
+  "name": "roblox-ai-dev-tool",
+  "displayName": "Roblox AI Dev Tool",
+  "description": "AI-powered Roblox game server development assistant",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other", "Programming Languages"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "robloxAI.openChat",        "title": "Roblox AI: Open Chat" },
+      { "command": "robloxAI.reviewFile",       "title": "Roblox AI: Review Current File" },
+      { "command": "robloxAI.generateScript",   "title": "Roblox AI: Generate Script…" },
+      { "command": "robloxAI.insertTemplate",   "title": "Roblox AI: Insert Template…" },
+      { "command": "robloxAI.showDeps",         "title": "Roblox AI: Show Dependency Graph" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "robloxAI.reviewFile",     "when": "resourceExtname == .lua || resourceExtname == .luau", "group": "robloxAI" },
+        { "command": "robloxAI.insertTemplate", "when": "resourceExtname == .lua || resourceExtname == .luau", "group": "robloxAI" }
+      ]
+    },
+    "configuration": {
+      "title": "Roblox AI Dev Tool",
+      "properties": {
+        "robloxAI.model": {
+          "type": "string",
+          "default": "claude-opus-4-6",
+          "description": "AI model spec, e.g. 'anthropic:claude-opus-4-6', 'openai:gpt-4o', 'ollama:llama3'"
+        },
+        "robloxAI.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key (leave empty to use ANTHROPIC_API_KEY env var)"
+        },
+        "robloxAI.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI API key"
+        },
+        "robloxAI.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to python executable running the roblox-dev-tool backend"
+        },
+        "robloxAI.autoLint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-lint generated scripts with selene"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "robloxAI", "title": "Roblox AI", "icon": "media/icon.svg" }
+      ]
+    },
+    "views": {
+      "robloxAI": [
+        { "type": "webview", "id": "robloxAI.chat", "name": "AI Chat" }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch":   "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node":   "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript":    "^5.3.0"
+  },
+  "dependencies": {}
+}

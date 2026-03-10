@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Roblox AI Dev Tool — powered by Claude
+Roblox AI Dev Tool — powered by any AI model
 Helps you build, debug, and architect Roblox game servers.
 
 Usage:
-  roblox-dev-tool                   # auto-detects Rojo project
-  roblox-dev-tool --project ./my-game
-  roblox-dev-tool --new-project MyGame
+  roblox-dev-tool                            # auto-detects Rojo project, uses Claude
+  roblox-dev-tool --model openai:gpt-4o      # use GPT-4o
+  roblox-dev-tool --model groq:llama-3.3-70b-versatile
+  roblox-dev-tool --model ollama:llama3      # local Ollama
+  roblox-dev-tool --model gemini:gemini-2.0-flash-exp
+  roblox-dev-tool --project ./my-game        # specify Rojo project directory
+  roblox-dev-tool --new-project MyGame       # scaffold a new Rojo project
 """
 
-import anthropic
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -25,7 +30,14 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.theme import Theme
 
+from ai_backend import AIBackend, StreamEndEvent, TextDeltaEvent, ToolCompleteEvent, ToolStartEvent, create_backend, list_providers
+from dependency_graph import DependencyGraph
+from git_manager import GitManager
+from open_cloud import OpenCloudClient, OpenCloudError
 from rojo_manager import RojoProject
+from selene_linter import format_issues, lint_code, selene_available
+from templates import get_template, list_templates, search_templates
+from watch_mode import FileWatcher
 
 # ─── Console ──────────────────────────────────────────────────────────────────
 
@@ -37,16 +49,21 @@ custom_theme = Theme(
         "error": "bold red",
         "tool": "bold magenta",
         "roblox": "bold bright_red",
-        "dim": "grey50",
     }
 )
 console = Console(theme=custom_theme)
 
-# ─── App state (mutable, shared across renderers) ─────────────────────────────
+# ─── App state ────────────────────────────────────────────────────────────────
 
 APP_STATE: dict[str, Any] = {
-    "rojo": None,           # Optional[RojoProject]
-    "last_script": None,    # last generate_script tool output
+    "backend": None,         # AIBackend
+    "rojo": None,            # Optional[RojoProject]
+    "last_script": None,     # last generated script info
+    "watcher": None,         # Optional[FileWatcher]
+    "auto_commit": False,    # auto-commit saved scripts
+    "auto_lint": True,       # lint generated scripts with selene
+    "git": None,             # Optional[GitManager]
+    "cloud": None,           # Optional[OpenCloudClient]
 }
 
 # ─── System prompt ────────────────────────────────────────────────────────────
@@ -62,94 +79,53 @@ SYSTEM_PROMPT = """You are an expert Roblox game server developer and architect.
 - Players, Workspace, ReplicatedStorage, ServerStorage, ServerScriptService
 - DataStoreService, MessagingService, MemoryStoreService
 - RunService (Heartbeat, Stepped, RenderStepped), TweenService
-- HttpService (for external APIs), MarketplaceService, BadgeService
-- PhysicsService (collision groups), Teams, SoundService
+- HttpService, MarketplaceService, BadgeService, PhysicsService, Teams
 
 **Networking & Security**
 - RemoteEvent and RemoteFunction (server↔client communication)
-- Always validate on the server side — never trust the client
+- Always validate on the server — never trust the client
 - Rate limiting, anti-exploit techniques, sanity checks
-- BindableEvent / BindableFunction for server-internal communication
 
 **Data & State**
 - DataStoreService: ordered/standard DataStores, retries, budgets
 - MemoryStoreService: fast ephemeral data (leaderboards, queues)
-- Auto-saving patterns, data migration, backup strategies
-- Session locking to prevent data loss on multiple servers
-
-**Game Systems**
-- Round systems, lobby/game state machines
-- Matchmaking with TeleportService and ReservedServers
-- Currency, inventory, trading systems
-- Combat, hitbox validation, damage systems
-- NPC AI (pathfinding, behavior trees)
-
-**Performance**
-- Part streaming (StreamingEnabled), LOD
-- Efficient Heartbeat usage, avoiding RunService overuse
-- Profiler usage, micro-optimization tips
-- Instance caching and pooling
+- Auto-saving patterns, data migration, session locking
 
 **Best Practices**
-- Module pattern for shared code
-- OOP with metatables or Luau classes
+- Module pattern, OOP with metatables or Luau classes
 - Error handling with pcall/xpcall
 - Proper cleanup (Connections, Instances) to avoid memory leaks
-- Signal patterns (using BindableEvents or custom signal libraries)
+- Signal patterns
 
 When generating code:
-1. Write idiomatic, well-commented Luau with proper type annotations
-2. Always include server-side validation for any client input
+1. Write idiomatic Luau with type annotations
+2. Include server-side validation for any client input
 3. Handle errors gracefully with pcall
-4. Follow Roblox naming conventions (PascalCase for services/classes, camelCase for variables)
+4. Follow Roblox naming conventions
 5. Specify whether code goes in Script, LocalScript, or ModuleScript
-6. Mention where in the Roblox Explorer hierarchy files should be placed
+6. Mention where files should be placed in the Explorer hierarchy"""
 
-Be concise but thorough. Show full working code examples, not pseudocode."""
-
-# ─── Tool definitions ─────────────────────────────────────────────────────────
+# ─── Tools ────────────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
         "name": "generate_script",
-        "description": (
-            "Generate a complete, ready-to-use Roblox Luau script for a specific feature or system. "
-            "Use this when the user wants to create a new script from scratch."
-        ),
+        "description": "Generate a complete, ready-to-use Roblox Luau script.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "script_type": {
-                    "type": "string",
-                    "enum": ["Script", "LocalScript", "ModuleScript"],
-                    "description": "The type of Roblox script to generate",
-                },
-                "feature": {
-                    "type": "string",
-                    "description": "What the script should do (e.g. 'player data saving', 'round system')",
-                },
-                "placement": {
-                    "type": "string",
-                    "description": "Where in the Roblox Explorer hierarchy (e.g. ServerScriptService, ReplicatedStorage.Modules)",
-                },
-                "code": {
-                    "type": "string",
-                    "description": "The complete Luau code for the script",
-                },
-                "notes": {
-                    "type": "string",
-                    "description": "Setup instructions, dependencies, or integration notes",
-                },
+                "script_type": {"type": "string", "enum": ["Script", "LocalScript", "ModuleScript"]},
+                "feature": {"type": "string"},
+                "placement": {"type": "string"},
+                "code": {"type": "string"},
+                "notes": {"type": "string"},
             },
             "required": ["script_type", "feature", "placement", "code"],
         },
     },
     {
         "name": "review_script",
-        "description": (
-            "Review a Roblox Luau script for bugs, security issues, performance problems, "
-            "and style improvements."
-        ),
+        "description": "Review a Roblox Luau script for bugs, security, and performance issues.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -158,10 +134,7 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "severity": {
-                                "type": "string",
-                                "enum": ["critical", "warning", "suggestion"],
-                            },
+                            "severity": {"type": "string", "enum": ["critical", "warning", "suggestion"]},
                             "line_hint": {"type": "string"},
                             "description": {"type": "string"},
                             "fix": {"type": "string"},
@@ -177,10 +150,7 @@ TOOLS = [
     },
     {
         "name": "suggest_architecture",
-        "description": (
-            "Suggest a server architecture or system design for a Roblox game feature, "
-            "including a breakdown of components, data flow, and implementation plan."
-        ),
+        "description": "Design a Roblox server architecture with components, data flow, and implementation plan.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -191,19 +161,7 @@ TOOLS = [
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
-                            "type": {
-                                "type": "string",
-                                "enum": [
-                                    "Script",
-                                    "LocalScript",
-                                    "ModuleScript",
-                                    "RemoteEvent",
-                                    "RemoteFunction",
-                                    "DataStore",
-                                    "Folder",
-                                    "Other",
-                                ],
-                            },
+                            "type": {"type": "string", "enum": ["Script", "LocalScript", "ModuleScript", "RemoteEvent", "RemoteFunction", "DataStore", "Folder", "Other"]},
                             "location": {"type": "string"},
                             "purpose": {"type": "string"},
                         },
@@ -211,10 +169,7 @@ TOOLS = [
                     },
                 },
                 "data_flow": {"type": "string"},
-                "implementation_steps": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
+                "implementation_steps": {"type": "array", "items": {"type": "string"}},
                 "security_notes": {"type": "string"},
             },
             "required": ["title", "components", "data_flow", "implementation_steps"],
@@ -222,10 +177,7 @@ TOOLS = [
     },
     {
         "name": "generate_datastore",
-        "description": (
-            "Generate a complete DataStore module for player data persistence, "
-            "including auto-save, session locking, and error handling."
-        ),
+        "description": "Generate a complete DataStore module with auto-save and session locking.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -240,10 +192,7 @@ TOOLS = [
     },
     {
         "name": "generate_remote_events",
-        "description": (
-            "Generate the RemoteEvent/RemoteFunction setup for a specific feature, "
-            "including server-side handlers with validation and client-side fire calls."
-        ),
+        "description": "Generate RemoteEvent/RemoteFunction setup with server-side validation.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -254,18 +203,8 @@ TOOLS = [
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
-                            "remote_type": {
-                                "type": "string",
-                                "enum": ["RemoteEvent", "RemoteFunction"],
-                            },
-                            "direction": {
-                                "type": "string",
-                                "enum": [
-                                    "client_to_server",
-                                    "server_to_client",
-                                    "bidirectional",
-                                ],
-                            },
+                            "remote_type": {"type": "string", "enum": ["RemoteEvent", "RemoteFunction"]},
+                            "direction": {"type": "string", "enum": ["client_to_server", "server_to_client", "bidirectional"]},
                             "parameters": {"type": "string"},
                         },
                         "required": ["name", "remote_type", "direction"],
@@ -277,221 +216,155 @@ TOOLS = [
             "required": ["feature", "remotes", "server_code", "client_code"],
         },
     },
+    {
+        "name": "generate_tests",
+        "description": "Generate TestEZ unit tests for a Roblox ModuleScript.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "module_name": {"type": "string"},
+                "test_code": {"type": "string"},
+                "placement": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["module_name", "test_code", "placement"],
+        },
+    },
 ]
 
 # ─── Tool renderers ───────────────────────────────────────────────────────────
 
 
-def render_generate_script(data: dict[str, Any]) -> None:
-    script_type = data.get("script_type", "Script")
-    feature = data.get("feature", "")
-    placement = data.get("placement", "")
-    code = data.get("code", "")
-    notes = data.get("notes", "")
+def _auto_lint_and_save(code: str, script_type: str, feature: str, placement: str) -> str | None:
+    """Run selene lint, optionally save to Rojo project. Returns saved path or None."""
+    # Lint
+    if APP_STATE["auto_lint"] and selene_available():
+        issues = lint_code(code, script_type)
+        if issues:
+            console.print(f"\n[warning]Selene found {len(issues)} issue(s):[/warning]")
+            console.print(format_issues(issues))
 
-    # Store for /save command
+    # Save to Rojo
+    rojo: RojoProject | None = APP_STATE.get("rojo")
+    if not rojo:
+        return None
+    try:
+        if Confirm.ask(
+            f"\n[cyan]Save to Rojo project '[bold]{rojo.name}[/bold]'?[/cyan]",
+            default=True,
+        ):
+            default_name = feature.replace(" ", "").replace("/", "")[:30]
+            name = Prompt.ask("[cyan]Filename (no extension)[/cyan]", default=default_name)
+            saved = rojo.save_script(script_type, placement, name, code)
+            console.print(f"[success]✔ Saved →[/success] {saved}")
+
+            # Auto-commit
+            if APP_STATE["auto_commit"] and APP_STATE["git"]:
+                ok, msg = APP_STATE["git"].auto_commit(
+                    APP_STATE["backend"], [saved], context=feature
+                )
+                if ok:
+                    console.print(f"[success]✔ Committed:[/success] {msg}")
+            return str(saved)
+    except Exception as exc:
+        console.print(f"[error]Save failed:[/error] {exc}")
+    return None
+
+
+def render_generate_script(data: dict) -> None:
     APP_STATE["last_script"] = data
-
     console.print(
         Panel(
-            f"[bold]{script_type}[/bold] — {feature}\n"
-            f"[dim]Place in:[/dim] [cyan]{placement}[/cyan]",
+            f"[bold]{data['script_type']}[/bold] — {data['feature']}\n"
+            f"[dim]Place in:[/dim] [cyan]{data['placement']}[/cyan]",
             title="[tool]Generated Script[/tool]",
             border_style="magenta",
         )
     )
-    console.print(Syntax(code, "lua", theme="monokai", line_numbers=True))
-    if notes:
-        console.print(Panel(Markdown(notes), title="Setup Notes", border_style="dim"))
-
-    # Auto-offer save to Rojo project
-    rojo: RojoProject | None = APP_STATE.get("rojo")
-    if rojo:
-        try:
-            if Confirm.ask(
-                f"\n[cyan]Save to Rojo project '[bold]{rojo.name}[/bold]'?[/cyan]",
-                default=True,
-            ):
-                default_name = feature.replace(" ", "").replace("/", "")[:30]
-                script_name = Prompt.ask(
-                    "[cyan]Filename (without extension)[/cyan]",
-                    default=default_name,
-                )
-                saved = rojo.save_script(script_type, placement, script_name, code)
-                console.print(f"[success]✔ Saved →[/success] {saved}")
-        except Exception as exc:
-            console.print(f"[error]Save failed:[/error] {exc}")
+    console.print(Syntax(data["code"], "lua", theme="monokai", line_numbers=True))
+    if data.get("notes"):
+        console.print(Panel(Markdown(data["notes"]), title="Setup Notes", border_style="dim"))
+    _auto_lint_and_save(data["code"], data["script_type"], data["feature"], data["placement"])
 
 
-def render_review_script(data: dict[str, Any]) -> None:
-    issues = data.get("issues", [])
-    summary = data.get("summary", "")
-    improved = data.get("improved_code", "")
-
-    severity_color = {"critical": "bold red", "warning": "yellow", "suggestion": "cyan"}
-    severity_icon = {"critical": "✖", "warning": "⚠", "suggestion": "➤"}
-
-    console.print(Panel(summary, title="[tool]Code Review[/tool]", border_style="magenta"))
-    for issue in issues:
-        sev = issue.get("severity", "suggestion")
-        color = severity_color.get(sev, "white")
-        icon = severity_icon.get(sev, "•")
-        line = f" (line {issue['line_hint']})" if issue.get("line_hint") else ""
+def render_review_script(data: dict) -> None:
+    sev_color = {"critical": "bold red", "warning": "yellow", "suggestion": "cyan"}
+    sev_icon = {"critical": "✖", "warning": "⚠", "suggestion": "➤"}
+    console.print(Panel(data.get("summary", ""), title="[tool]Code Review[/tool]", border_style="magenta"))
+    for iss in data.get("issues", []):
+        sev = iss.get("severity", "suggestion")
+        ln = f" (line {iss['line_hint']})" if iss.get("line_hint") else ""
         console.print(
-            f"  [{color}]{icon} [{sev.upper()}]{line}[/{color}] {issue['description']}"
+            f"  [{sev_color.get(sev, 'white')}]{sev_icon.get(sev, '•')} [{sev.upper()}]{ln}[/{sev_color.get(sev, 'white')}] {iss['description']}"
         )
-        console.print(f"    [dim]Fix:[/dim] {issue['fix']}\n")
-
-    if improved:
+        console.print(f"    [dim]Fix:[/dim] {iss['fix']}\n")
+    if data.get("improved_code"):
         console.print(Panel("[bold]Improved Code[/bold]", border_style="green"))
-        console.print(Syntax(improved, "lua", theme="monokai", line_numbers=True))
-        APP_STATE["last_script"] = {
-            "script_type": "ModuleScript",
-            "feature": "reviewed script",
-            "placement": "ReplicatedStorage",
-            "code": improved,
-        }
+        console.print(Syntax(data["improved_code"], "lua", theme="monokai", line_numbers=True))
+        APP_STATE["last_script"] = {**data, "code": data["improved_code"], "script_type": "ModuleScript", "placement": "ReplicatedStorage"}
 
 
-def render_suggest_architecture(data: dict[str, Any]) -> None:
-    title = data.get("title", "Architecture")
-    components = data.get("components", [])
-    data_flow = data.get("data_flow", "")
-    steps = data.get("implementation_steps", [])
-    security = data.get("security_notes", "")
-
-    type_icons = {
-        "Script": "📜",
-        "LocalScript": "💻",
-        "ModuleScript": "📦",
-        "RemoteEvent": "📡",
-        "RemoteFunction": "🔄",
-        "DataStore": "🗄",
-        "Folder": "📁",
-        "Other": "🔧",
-    }
-
-    console.print(
-        Panel(f"[bold]{title}[/bold]", title="[tool]Architecture[/tool]", border_style="magenta")
-    )
-
+def render_suggest_architecture(data: dict) -> None:
+    type_icons = {"Script": "📜", "LocalScript": "💻", "ModuleScript": "📦", "RemoteEvent": "📡", "RemoteFunction": "🔄", "DataStore": "🗄", "Folder": "📁", "Other": "🔧"}
+    console.print(Panel(f"[bold]{data.get('title', '')}[/bold]", title="[tool]Architecture[/tool]", border_style="magenta"))
     tbl = Table(show_header=True, header_style="bold cyan", border_style="dim")
-    tbl.add_column("Component")
-    tbl.add_column("Type")
-    tbl.add_column("Location")
-    tbl.add_column("Purpose")
-    for comp in components:
-        icon = type_icons.get(comp.get("type", "Other"), "🔧")
-        tbl.add_row(
-            f"{icon} {comp['name']}",
-            comp.get("type", ""),
-            comp.get("location", ""),
-            comp.get("purpose", ""),
-        )
+    tbl.add_column("Component"); tbl.add_column("Type"); tbl.add_column("Location"); tbl.add_column("Purpose")
+    for c in data.get("components", []):
+        tbl.add_row(f"{type_icons.get(c.get('type','Other'),'🔧')} {c['name']}", c.get("type",""), c.get("location",""), c.get("purpose",""))
     console.print(tbl)
-    console.print(f"\n[bold]Data Flow:[/bold]\n{data_flow}\n")
-
-    if steps:
+    console.print(f"\n[bold]Data Flow:[/bold]\n{data.get('data_flow', '')}\n")
+    if data.get("implementation_steps"):
         console.print("[bold]Implementation Order:[/bold]")
-        for i, step in enumerate(steps, 1):
-            console.print(f"  {i}. {step}")
-
-    if security:
-        console.print(Panel(security, title="Security Notes", border_style="yellow"))
-
-
-def render_generate_datastore(data: dict[str, Any]) -> None:
-    store_name = data.get("store_name", "PlayerData")
-    schema = data.get("data_schema", {})
-    code = data.get("code", "")
-    notes = data.get("notes", "")
-
-    APP_STATE["last_script"] = {
-        "script_type": "ModuleScript",
-        "feature": store_name,
-        "placement": "ServerScriptService",
-        "code": code,
-    }
-
-    console.print(
-        Panel(
-            f"[bold]DataStore:[/bold] [cyan]{store_name}[/cyan]\n"
-            f"[dim]Default schema:[/dim] {json.dumps(schema, indent=2)}",
-            title="[tool]DataStore Module[/tool]",
-            border_style="magenta",
-        )
-    )
-    console.print(Syntax(code, "lua", theme="monokai", line_numbers=True))
-    if notes:
-        console.print(Panel(Markdown(notes), title="Setup Notes", border_style="dim"))
-
-    rojo: RojoProject | None = APP_STATE.get("rojo")
-    if rojo:
-        try:
-            if Confirm.ask(
-                f"\n[cyan]Save DataStore module to Rojo project '[bold]{rojo.name}[/bold]'?[/cyan]",
-                default=True,
-            ):
-                name = Prompt.ask("[cyan]Filename[/cyan]", default=store_name)
-                saved = rojo.save_script("ModuleScript", "ServerScriptService", name, code)
-                console.print(f"[success]✔ Saved →[/success] {saved}")
-        except Exception as exc:
-            console.print(f"[error]Save failed:[/error] {exc}")
+        for i, s in enumerate(data["implementation_steps"], 1):
+            console.print(f"  {i}. {s}")
+    if data.get("security_notes"):
+        console.print(Panel(data["security_notes"], title="Security Notes", border_style="yellow"))
 
 
-def render_generate_remote_events(data: dict[str, Any]) -> None:
-    feature = data.get("feature", "")
-    remotes = data.get("remotes", [])
-    server_code = data.get("server_code", "")
-    client_code = data.get("client_code", "")
+def render_generate_datastore(data: dict) -> None:
+    APP_STATE["last_script"] = {**data, "script_type": "ModuleScript", "feature": data["store_name"], "placement": "ServerScriptService"}
+    console.print(Panel(
+        f"[bold]DataStore:[/bold] [cyan]{data.get('store_name', '')}[/cyan]\n"
+        f"[dim]Schema:[/dim] {json.dumps(data.get('data_schema', {}), indent=2)}",
+        title="[tool]DataStore Module[/tool]", border_style="magenta"
+    ))
+    console.print(Syntax(data.get("code", ""), "lua", theme="monokai", line_numbers=True))
+    if data.get("notes"):
+        console.print(Panel(Markdown(data["notes"]), title="Setup Notes", border_style="dim"))
+    _auto_lint_and_save(data["code"], "ModuleScript", data["store_name"], "ServerScriptService")
 
-    dir_labels = {
-        "client_to_server": "Client → Server",
-        "server_to_client": "Server → Client",
-        "bidirectional": "Bidirectional ↔",
-    }
 
-    console.print(
-        Panel(
-            f"[bold]Remote Events for:[/bold] {feature}",
-            title="[tool]Remote Events[/tool]",
-            border_style="magenta",
-        )
-    )
-
+def render_generate_remote_events(data: dict) -> None:
+    dir_labels = {"client_to_server": "Client → Server", "server_to_client": "Server → Client", "bidirectional": "↔ Bidirectional"}
+    console.print(Panel(f"[bold]Remote Events for:[/bold] {data.get('feature', '')}", title="[tool]Remote Events[/tool]", border_style="magenta"))
     tbl = Table(show_header=True, header_style="bold cyan", border_style="dim")
-    tbl.add_column("Name")
-    tbl.add_column("Type")
-    tbl.add_column("Direction")
-    tbl.add_column("Parameters")
-    for r in remotes:
-        tbl.add_row(
-            r["name"],
-            r["remote_type"],
-            dir_labels.get(r.get("direction", ""), r.get("direction", "")),
-            r.get("parameters", "—"),
-        )
+    tbl.add_column("Name"); tbl.add_column("Type"); tbl.add_column("Direction"); tbl.add_column("Parameters")
+    for r in data.get("remotes", []):
+        tbl.add_row(r["name"], r["remote_type"], dir_labels.get(r.get("direction", ""), ""), r.get("parameters", "—"))
     console.print(tbl)
-
-    console.print("\n[bold]Server Handler (ServerScriptService → Script):[/bold]")
-    console.print(Syntax(server_code, "lua", theme="monokai", line_numbers=True))
-    console.print("\n[bold]Client Usage (StarterPlayerScripts → LocalScript):[/bold]")
-    console.print(Syntax(client_code, "lua", theme="monokai", line_numbers=True))
-
-    rojo: RojoProject | None = APP_STATE.get("rojo")
+    console.print("\n[bold]Server Handler:[/bold]")
+    console.print(Syntax(data.get("server_code", ""), "lua", theme="monokai", line_numbers=True))
+    console.print("\n[bold]Client Usage:[/bold]")
+    console.print(Syntax(data.get("client_code", ""), "lua", theme="monokai", line_numbers=True))
+    rojo = APP_STATE.get("rojo")
     if rojo:
         try:
-            if Confirm.ask(
-                f"\n[cyan]Save both scripts to Rojo project '[bold]{rojo.name}[/bold]'?[/cyan]",
-                default=True,
-            ):
-                base = Prompt.ask("[cyan]Base filename[/cyan]", default=feature.replace(" ", "")[:20])
-                s = rojo.save_script("Script", "ServerScriptService", f"{base}Handler", server_code)
-                c = rojo.save_script("LocalScript", "StarterPlayerScripts", f"{base}Client", client_code)
-                console.print(f"[success]✔ Saved →[/success] {s}")
-                console.print(f"[success]✔ Saved →[/success] {c}")
+            if Confirm.ask(f"\n[cyan]Save both scripts to Rojo project?[/cyan]", default=True):
+                base = Prompt.ask("[cyan]Base filename[/cyan]", default=data.get("feature", "").replace(" ", "")[:20])
+                s = rojo.save_script("Script", "ServerScriptService", f"{base}Handler", data.get("server_code", ""))
+                c = rojo.save_script("LocalScript", "StarterPlayerScripts", f"{base}Client", data.get("client_code", ""))
+                console.print(f"[success]✔[/success] {s}\n[success]✔[/success] {c}")
         except Exception as exc:
-            console.print(f"[error]Save failed:[/error] {exc}")
+            console.print(f"[error]{exc}[/error]")
+
+
+def render_generate_tests(data: dict) -> None:
+    APP_STATE["last_script"] = {**data, "script_type": "ModuleScript", "feature": f"{data['module_name']} tests", "placement": data.get("placement", "ReplicatedStorage")}
+    console.print(Panel(f"[bold]TestEZ Tests for:[/bold] [cyan]{data.get('module_name', '')}[/cyan]", title="[tool]TestEZ Tests[/tool]", border_style="magenta"))
+    console.print(Syntax(data.get("test_code", ""), "lua", theme="monokai", line_numbers=True))
+    if data.get("notes"):
+        console.print(Panel(Markdown(data["notes"]), title="Setup Notes", border_style="dim"))
+    _auto_lint_and_save(data["test_code"], "ModuleScript", f"{data['module_name']}_spec", data.get("placement", "ReplicatedStorage"))
 
 
 TOOL_RENDERERS = {
@@ -500,10 +373,11 @@ TOOL_RENDERERS = {
     "suggest_architecture": render_suggest_architecture,
     "generate_datastore": render_generate_datastore,
     "generate_remote_events": render_generate_remote_events,
+    "generate_tests": render_generate_tests,
 }
 
 
-def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
+def execute_tool(tool_name: str, tool_input: dict) -> str:
     renderer = TOOL_RENDERERS.get(tool_name)
     if renderer:
         renderer(tool_input)
@@ -512,324 +386,342 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
 
 # ─── Slash command handlers ───────────────────────────────────────────────────
 
-UPGRADES = [
-    {
-        "title": "Selene Linting",
-        "priority": "High",
-        "description": (
-            "Auto-lint every generated Luau script with selene "
-            "(https://github.com/Kampfkarren/selene). Catches undefined globals, "
-            "style issues, and bad patterns before you paste code into Studio."
-        ),
-    },
-    {
-        "title": "Watch Mode",
-        "priority": "High",
-        "description": (
-            "Watch the Rojo src/ directory for changes. When a .luau file is "
-            "modified, automatically send it to Claude for a quick review and "
-            "display any issues inline."
-        ),
-    },
-    {
-        "title": "Multi-Script Feature Generation",
-        "priority": "High",
-        "description": (
-            "Ask Claude to generate an entire feature (e.g. a full shop system) "
-            "and have it produce all necessary Scripts, ModuleScripts, RemoteEvents, "
-            "and folder structure in one pass — saving every file into Rojo."
-        ),
-    },
-    {
-        "title": "Roblox Open Cloud Integration",
-        "priority": "Medium",
-        "description": (
-            "Use the Roblox Open Cloud API to read live DataStore entries, "
-            "publish place files, and manage universes directly from the CLI — "
-            "great for debugging production data issues."
-        ),
-    },
-    {
-        "title": "TestEZ Test Generation",
-        "priority": "Medium",
-        "description": (
-            "Automatically generate TestEZ unit tests for any ModuleScript. "
-            "Tests go in a parallel __tests__ folder and integrate with Rojo's "
-            "test runner setup."
-        ),
-    },
-    {
-        "title": "Dependency Graph Visualiser",
-        "priority": "Medium",
-        "description": (
-            "Parse all require() calls in your src/ directory and generate an "
-            "ASCII or Graphviz diagram showing how your ModuleScripts depend on "
-            "each other. Spots circular dependencies and dead code."
-        ),
-    },
-    {
-        "title": "VS Code Extension",
-        "priority": "Medium",
-        "description": (
-            "A sidebar panel in VS Code that provides the same AI chat, "
-            "inline code review on hover, and one-click script generation — "
-            "without leaving your editor."
-        ),
-    },
-    {
-        "title": "Roblox Studio Plugin",
-        "priority": "Medium",
-        "description": (
-            "An in-Studio plugin that adds an AI chat panel, lets you select "
-            "any Script in the Explorer and right-click → 'Review with AI', "
-            "and inserts generated code directly into the correct service."
-        ),
-    },
-    {
-        "title": "Template Library",
-        "priority": "Low",
-        "description": (
-            "A built-in catalogue of battle-tested patterns: singleton service, "
-            "observer/signal, state machine, OOP class template, promise wrapper. "
-            "Browse with /templates and insert into your project instantly."
-        ),
-    },
-    {
-        "title": "Git Auto-Commit",
-        "priority": "Low",
-        "description": (
-            "After each successful file save to the Rojo project, optionally "
-            "run git add + git commit with an AI-generated commit message "
-            "describing what was changed."
-        ),
-    },
-]
-
 
 def cmd_help() -> None:
-    console.print(
-        Panel(
-            "[bold]Chat Commands:[/bold]\n"
-            "  [cyan]/help[/cyan]              Show this help\n"
-            "  [cyan]/clear[/cyan]             Clear conversation history\n"
-            "  [cyan]/save [name][/cyan]       Save last generated script to Rojo project\n"
-            "  [cyan]/read <path>[/cyan]       Read a project script into the conversation\n"
-            "  [cyan]/list[/cyan]              List all scripts in the Rojo project\n"
-            "  [cyan]/rojo[/cyan]              Show Rojo project status\n"
-            "  [cyan]/new-project <name>[/cyan] Create a new Rojo project here\n"
-            "  [cyan]/upgrades[/cyan]          Show suggested upgrades for this tool\n"
-            "  [cyan]/quit[/cyan]              Exit\n\n"
-            "[bold]Example prompts:[/bold]\n"
-            "  • Generate a round system with lobby, game, and intermission states\n"
-            "  • Create a DataStore module for saving coins, level, and inventory\n"
-            "  • Design the architecture for a player trading system\n"
-            "  • Set up RemoteEvents for a shop — make it exploit-proof\n"
-            "  • Review this script: [paste code]\n"
-            "  • How do I prevent exploiters from firing my RemoteEvent?\n"
-            "  • Generate a pathfinding NPC module with aggro range",
-            title="Help",
-            border_style="cyan",
-        )
-    )
+    console.print(Panel(
+        "[bold]Chat Commands:[/bold]\n"
+        "  [cyan]/help[/cyan]                    Show this help\n"
+        "  [cyan]/clear[/cyan]                   Clear conversation history\n"
+        "  [cyan]/model [spec][/cyan]            Switch AI model (e.g. openai:gpt-4o)\n"
+        "  [cyan]/models[/cyan]                  List all configured providers\n"
+        "  [cyan]/rojo[/cyan]                    Show Rojo project status\n"
+        "  [cyan]/new-project <name>[/cyan]       Scaffold a new Rojo project\n"
+        "  [cyan]/save [name][/cyan]             Save last script to Rojo project\n"
+        "  [cyan]/read <path>[/cyan]             Load script into conversation\n"
+        "  [cyan]/list[/cyan]                    List all scripts in project\n"
+        "  [cyan]/deps[/cyan]                    Show require() dependency graph\n"
+        "  [cyan]/watch[/cyan]                   Start/stop auto-review on file changes\n"
+        "  [cyan]/templates[/cyan]               Browse built-in code templates\n"
+        "  [cyan]/templates <query>[/cyan]        Search templates\n"
+        "  [cyan]/template <name>[/cyan]         Insert a template into the project\n"
+        "  [cyan]/cloud-info[/cyan]              Show Roblox Open Cloud universe info\n"
+        "  [cyan]/cloud-read <store> <key>[/cyan] Read a DataStore entry\n"
+        "  [cyan]/cloud-list <store>[/cyan]       List DataStore keys\n"
+        "  [cyan]/autocommit [on|off][/cyan]      Toggle git auto-commit after saves\n"
+        "  [cyan]/lint [on|off][/cyan]            Toggle selene auto-lint\n"
+        "  [cyan]/upgrades[/cyan]                Show upgrade roadmap\n"
+        "  [cyan]/quit[/cyan]                    Exit\n\n"
+        "[bold]Example prompts:[/bold]\n"
+        "  • Generate a round system with lobby, game, and intermission states\n"
+        "  • Create a DataStore module for saving coins, level, and inventory\n"
+        "  • Design the architecture for a player trading system\n"
+        "  • Set up RemoteEvents for a shop — make it exploit-proof\n"
+        "  • Generate TestEZ tests for my DataManager module\n"
+        "  • Review this script: [paste code]\n"
+        "  • Generate a pathfinding NPC with aggro range",
+        title="Help", border_style="cyan"
+    ))
+
+
+def cmd_models() -> None:
+    current: AIBackend | None = APP_STATE.get("backend")
+    tbl = Table(show_header=True, header_style="bold cyan", border_style="dim")
+    tbl.add_column("Provider"); tbl.add_column("Status"); tbl.add_column("Env Var"); tbl.add_column("Example Models")
+    for p in list_providers():
+        configured = "[success]✔ ready[/success]" if p["configured"] else "[dim]not configured[/dim]"
+        active = " [bold bright_red]← current[/bold bright_red]" if current and current.provider == p["provider"] else ""
+        tbl.add_row(p["provider"] + active, configured, p["env_var"] or "none", p["models"])
+    console.print(Panel(tbl, title=f"AI Models  (current: [bold]{current}[/bold])", border_style="cyan"))
+    console.print("\n[dim]Switch with: /model <provider>:<model_id>   e.g.  /model openai:gpt-4o[/dim]")
+
+
+def cmd_switch_model(spec: str, messages: list[dict]) -> None:
+    if not spec:
+        cmd_models()
+        return
+    try:
+        new_backend = create_backend(spec)
+        APP_STATE["backend"] = new_backend
+        messages.clear()
+        console.print(f"[success]✔ Switched to:[/success] [bold]{new_backend}[/bold]  (history cleared)")
+    except Exception as exc:
+        console.print(f"[error]Could not create backend '{spec}':[/error] {exc}")
 
 
 def cmd_rojo() -> None:
     rojo: RojoProject | None = APP_STATE.get("rojo")
     if not rojo:
-        console.print(
-            Panel(
-                "[warning]No Rojo project detected.[/warning]\n\n"
-                "Run [cyan]/new-project <name>[/cyan] to scaffold one here,\n"
-                "or open the tool from a directory containing [bold]default.project.json[/bold].",
-                title="Rojo Status",
-                border_style="yellow",
-            )
-        )
+        console.print(Panel("[warning]No Rojo project detected.[/warning]\nRun [cyan]/new-project <name>[/cyan] to scaffold one.", title="Rojo Status", border_style="yellow"))
         return
-
     summary = rojo.summary()
     scripts = summary["scripts"]
-
-    tbl = Table(show_header=True, header_style="bold cyan", border_style="dim", title="Scripts in project")
-    tbl.add_column("#", style="dim", width=4)
-    tbl.add_column("Path")
-    tbl.add_column("Type")
-    tbl.add_column("Lines", justify="right")
+    tbl = Table(show_header=True, header_style="bold cyan", border_style="dim", title="Scripts")
+    tbl.add_column("#", width=4); tbl.add_column("Path"); tbl.add_column("Type"); tbl.add_column("Lines", justify="right")
     for i, s in enumerate(scripts, 1):
         tbl.add_row(str(i), s["path"], s["type"], str(s["size_lines"]))
-
-    console.print(
-        Panel(
-            f"[bold]Project:[/bold] {summary['name']}\n"
-            f"[bold]Directory:[/bold] [cyan]{summary['project_dir']}[/cyan]\n"
-            f"[bold]Scripts:[/bold] {summary['script_count']}",
-            title="[success]Rojo Project Connected[/success]",
-            border_style="green",
-        )
-    )
+    console.print(Panel(f"[bold]Project:[/bold] {summary['name']}\n[bold]Directory:[/bold] [cyan]{summary['project_dir']}[/cyan]\n[bold]Scripts:[/bold] {summary['script_count']}", title="[success]Rojo Connected[/success]", border_style="green"))
     if scripts:
         console.print(tbl)
 
 
 def cmd_save(args: str, messages: list[dict]) -> None:
-    rojo: RojoProject | None = APP_STATE.get("rojo")
-    if not rojo:
-        console.print("[warning]No Rojo project connected. Use /new-project <name> first.[/warning]")
-        return
-
+    rojo = APP_STATE.get("rojo")
     last = APP_STATE.get("last_script")
+    if not rojo:
+        console.print("[warning]No Rojo project connected. Use /new-project first.[/warning]"); return
     if not last:
-        console.print("[warning]No script has been generated yet.[/warning]")
-        return
-
-    script_name = args.strip() or Prompt.ask(
-        "[cyan]Filename (without extension)[/cyan]",
-        default=last.get("feature", "Script").replace(" ", "")[:30],
-    )
+        console.print("[warning]No script generated yet.[/warning]"); return
+    name = args.strip() or Prompt.ask("[cyan]Filename[/cyan]", default=last.get("feature", "Script").replace(" ", "")[:30])
     try:
-        saved = rojo.save_script(
-            last["script_type"], last["placement"], script_name, last["code"]
-        )
+        saved = rojo.save_script(last["script_type"], last["placement"], name, last["code"])
         console.print(f"[success]✔ Saved →[/success] {saved}")
     except Exception as exc:
-        console.print(f"[error]Save failed:[/error] {exc}")
+        console.print(f"[error]{exc}[/error]")
 
 
 def cmd_read(path_arg: str, messages: list[dict]) -> None:
-    rojo: RojoProject | None = APP_STATE.get("rojo")
+    rojo = APP_STATE.get("rojo")
     if not path_arg:
-        console.print("[warning]Usage: /read <relative-path>[/warning]")
-        return
-
+        console.print("[warning]Usage: /read <path>[/warning]"); return
     try:
-        if rojo:
-            code = rojo.read_script(path_arg)
-        else:
-            from pathlib import Path
-            code = Path(path_arg).read_text(encoding="utf-8")
-
+        code = rojo.read_script(path_arg) if rojo else open(path_arg, encoding="utf-8").read()
         console.print(Panel(f"[dim]{path_arg}[/dim]", border_style="dim"))
         console.print(Syntax(code, "lua", theme="monokai", line_numbers=True))
-
-        messages.append({
-            "role": "user",
-            "content": f"Here is the script at `{path_arg}` for context:\n```luau\n{code}\n```",
-        })
-        messages.append({
-            "role": "assistant",
-            "content": f"Got it — I've read `{path_arg}` ({len(code.splitlines())} lines). What would you like me to do with it?",
-        })
-        console.print(f"[dim]Script loaded into conversation context.[/dim]")
+        messages.append({"role": "user", "content": f"Here is the script at `{path_arg}`:\n```luau\n{code}\n```"})
+        messages.append({"role": "assistant", "content": f"Got it — I've loaded `{path_arg}` ({len(code.splitlines())} lines). What would you like me to do with it?"})
+        console.print("[dim]Script loaded into conversation.[/dim]")
     except FileNotFoundError:
         console.print(f"[error]File not found:[/error] {path_arg}")
     except Exception as exc:
-        console.print(f"[error]Error reading file:[/error] {exc}")
+        console.print(f"[error]{exc}[/error]")
 
 
-def cmd_list() -> None:
-    rojo: RojoProject | None = APP_STATE.get("rojo")
+def cmd_deps() -> None:
+    rojo = APP_STATE.get("rojo")
     if not rojo:
-        console.print("[warning]No Rojo project connected.[/warning]")
+        console.print("[warning]No Rojo project connected.[/warning]"); return
+    g = DependencyGraph(rojo)
+    g.build()
+    cycles = g.find_cycles()
+    console.print(Panel(f"[bold]Dependency Graph — {rojo.name}[/bold]\n{g.summary()}", border_style="cyan"))
+    console.print(g.to_ascii())
+    if cycles:
+        console.print(f"\n[error]Circular dependencies detected:[/error]")
+        for cycle in cycles:
+            console.print(f"  [red]⟳[/red] {' → '.join(cycle)}")
+
+
+def cmd_watch(args: str) -> None:
+    rojo = APP_STATE.get("rojo")
+    backend = APP_STATE.get("backend")
+    if not rojo or not backend:
+        console.print("[warning]Needs a Rojo project and AI model. Use /rojo and check /models.[/warning]"); return
+    watcher: FileWatcher | None = APP_STATE.get("watcher")
+    if args.lower() in ("off", "stop", "0"):
+        if watcher:
+            watcher.stop()
+            APP_STATE["watcher"] = None
         return
-    cmd_rojo()
+    if watcher and watcher.is_running:
+        console.print("[dim]Watch mode is already running. Use /watch off to stop.[/dim]"); return
+    w = FileWatcher(rojo, backend, console)
+    if w.start():
+        APP_STATE["watcher"] = w
+
+
+def cmd_templates(query: str) -> None:
+    if query:
+        results = search_templates(query)
+        if not results:
+            console.print(f"[warning]No templates matching '{query}'.[/warning]"); return
+    else:
+        results = list_templates()
+    tbl = Table(show_header=True, header_style="bold cyan", border_style="dim")
+    tbl.add_column("Name"); tbl.add_column("Title"); tbl.add_column("Type"); tbl.add_column("Description")
+    for t in results:
+        tbl.add_row(f"[cyan]{t['name']}[/cyan]", t["title"], t["type"], t["description"])
+    console.print(Panel(tbl, title="Templates  (use /template <name> to insert)", border_style="cyan"))
+
+
+def cmd_template_insert(name: str) -> None:
+    t = get_template(name)
+    if not t:
+        console.print(f"[error]Template '{name}' not found. Use /templates to list.[/error]"); return
+    console.print(Panel(f"[bold]{t['title']}[/bold] ({t['type']})\n[dim]Placement: {t['placement']}[/dim]", title="[tool]Template[/tool]", border_style="magenta"))
+    console.print(Syntax(t["code"], "lua", theme="monokai", line_numbers=True))
+    APP_STATE["last_script"] = {"script_type": t["type"], "feature": t["title"], "placement": t["placement"], "code": t["code"]}
+    rojo = APP_STATE.get("rojo")
+    if rojo:
+        try:
+            if Confirm.ask(f"[cyan]Save to Rojo project?[/cyan]", default=True):
+                saved = rojo.save_script(t["type"], t["placement"], t["name"], t["code"])
+                console.print(f"[success]✔ Saved →[/success] {saved}")
+        except Exception as exc:
+            console.print(f"[error]{exc}[/error]")
+
+
+def cmd_cloud_info() -> None:
+    cloud = APP_STATE.get("cloud")
+    if not cloud or not cloud.is_configured():
+        console.print(Panel("[warning]Open Cloud not configured.[/warning]\nSet env vars:\n  [cyan]ROBLOX_OPEN_CLOUD_KEY[/cyan]\n  [cyan]ROBLOX_UNIVERSE_ID[/cyan]", title="Open Cloud", border_style="yellow")); return
+    try:
+        info = cloud.get_universe()
+        console.print(Panel(json.dumps(info, indent=2), title="[tool]Universe Info[/tool]", border_style="cyan"))
+    except OpenCloudError as e:
+        console.print(f"[error]Open Cloud error:[/error] {e}")
+
+
+def cmd_cloud_read(args: str) -> None:
+    cloud = APP_STATE.get("cloud")
+    if not cloud or not cloud.is_configured():
+        console.print("[warning]Open Cloud not configured. See /cloud-info.[/warning]"); return
+    parts = args.split(None, 1)
+    if len(parts) < 2:
+        console.print("[warning]Usage: /cloud-read <datastore> <key>[/warning]"); return
+    try:
+        value, meta = cloud.get_entry(parts[0], parts[1])
+        console.print(Panel(json.dumps({"value": value, "metadata": meta}, indent=2), title=f"[tool]DataStore: {parts[0]} / {parts[1]}[/tool]", border_style="cyan"))
+    except OpenCloudError as e:
+        console.print(f"[error]{e}[/error]")
+
+
+def cmd_cloud_list(args: str) -> None:
+    cloud = APP_STATE.get("cloud")
+    if not cloud or not cloud.is_configured():
+        console.print("[warning]Open Cloud not configured. See /cloud-info.[/warning]"); return
+    if not args.strip():
+        console.print("[warning]Usage: /cloud-list <datastore>[/warning]"); return
+    try:
+        result = cloud.list_entries(args.strip())
+        keys = result.get("keys", [])
+        tbl = Table(show_header=True, border_style="dim")
+        tbl.add_column("Key"); tbl.add_column("Scope")
+        for entry in keys:
+            tbl.add_row(entry.get("key", ""), entry.get("scope", "global"))
+        console.print(Panel(tbl, title=f"[tool]Keys in '{args.strip()}'[/tool]", border_style="cyan"))
+    except OpenCloudError as e:
+        console.print(f"[error]{e}[/error]")
 
 
 def cmd_new_project(name: str) -> None:
     if not name:
         name = Prompt.ask("[cyan]Project name[/cyan]", default="MyGame")
-
     dest = Prompt.ask("[cyan]Directory[/cyan]", default=os.getcwd())
     try:
         proj = RojoProject.create(dest, name)
         APP_STATE["rojo"] = proj
-        console.print(
-            Panel(
-                f"[bold]Created Rojo project:[/bold] [cyan]{name}[/cyan]\n"
-                f"[dim]{proj.project_dir}[/dim]\n\n"
-                "Starter scripts written to [bold]src/[/bold].\n"
-                "Run [bold]rojo serve[/bold] in that directory to start syncing.",
-                title="[success]Rojo Project Created[/success]",
-                border_style="green",
-            )
-        )
+        APP_STATE["git"] = GitManager(dest)
+        console.print(Panel(f"[bold]Created:[/bold] [cyan]{name}[/cyan]\n[dim]{proj.project_dir}[/dim]\n\nRun [bold]rojo serve[/bold] to start syncing with Studio.", title="[success]Rojo Project Created[/success]", border_style="green"))
     except Exception as exc:
-        console.print(f"[error]Failed to create project:[/error] {exc}")
+        console.print(f"[error]{exc}[/error]")
+
+
+def cmd_autocommit(args: str) -> None:
+    if args.lower() in ("on", "1", "yes", "true"):
+        APP_STATE["auto_commit"] = True
+    elif args.lower() in ("off", "0", "no", "false"):
+        APP_STATE["auto_commit"] = False
+    state = "[success]ON[/success]" if APP_STATE["auto_commit"] else "[warning]OFF[/warning]"
+    console.print(f"Auto-commit: {state}")
+
+
+def cmd_lint_toggle(args: str) -> None:
+    if args.lower() in ("on", "1", "yes"):
+        APP_STATE["auto_lint"] = True
+    elif args.lower() in ("off", "0", "no"):
+        APP_STATE["auto_lint"] = False
+    avail = " [dim](selene not installed)[/dim]" if not selene_available() else ""
+    state = "[success]ON[/success]" if APP_STATE["auto_lint"] else "[warning]OFF[/warning]"
+    console.print(f"Auto-lint (selene): {state}{avail}")
 
 
 def cmd_upgrades() -> None:
-    priority_color = {"High": "bold green", "Medium": "yellow", "Low": "cyan"}
-    console.print(
-        Panel(
-            "[bold]Suggested Upgrades[/bold]\n[dim]Ideas to make this tool more powerful[/dim]",
-            border_style="magenta",
-        )
-    )
-    for i, upg in enumerate(UPGRADES, 1):
-        pc = priority_color.get(upg["priority"], "white")
-        console.print(
-            f"\n  [bold]{i}. {upg['title']}[/bold]  [{pc}]({upg['priority']} priority)[/{pc}]"
-        )
-        console.print(f"     {upg['description']}")
+    upgrades = [
+        ("✅", "High", "Selene Linting", "Auto-lint on script generation"),
+        ("✅", "High", "Watch Mode", "Auto-review on file change"),
+        ("✅", "High", "Multi-Script Generation", "generate_tests tool added"),
+        ("✅", "High", "Multi-Model Support", "8 providers: Anthropic, OpenAI, Groq, Gemini, Ollama, OpenRouter, Mistral, Together"),
+        ("✅", "Medium", "Roblox Open Cloud", "DataStore read/write, place publish"),
+        ("✅", "Medium", "TestEZ Test Generation", "generate_tests tool"),
+        ("✅", "Medium", "Dependency Graph", "/deps command"),
+        ("✅", "Medium", "VS Code Extension", "vscode-extension/ folder"),
+        ("✅", "Medium", "Roblox Studio Plugin", "studio-plugin/ folder"),
+        ("✅", "Low", "Template Library", "8 templates: singleton, signal, FSM, class, round, DataStore, bridge, promise"),
+        ("✅", "Low", "Git Auto-Commit", "/autocommit toggle"),
+    ]
+    tbl = Table(show_header=True, header_style="bold cyan", border_style="dim")
+    tbl.add_column(""); tbl.add_column("Priority"); tbl.add_column("Feature"); tbl.add_column("Status")
+    for icon, pri, name, status in upgrades:
+        tbl.add_row(icon, pri, name, status)
+    console.print(Panel(tbl, title="[tool]Upgrade Roadmap[/tool]", border_style="magenta"))
 
 
 def handle_slash_command(user_input: str, messages: list[dict]) -> bool:
-    """
-    Handle /commands. Returns True if the input was a slash command
-    (so the chat loop should skip the API call).
-    """
     parts = user_input.strip().split(None, 1)
     cmd = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
 
-    if cmd in ("/help", "/?"):
-        cmd_help()
-    elif cmd == "/clear":
-        messages.clear()
-        console.print("[dim]Conversation cleared.[/dim]")
-    elif cmd == "/rojo":
-        cmd_rojo()
-    elif cmd == "/save":
-        cmd_save(args, messages)
-    elif cmd == "/read":
-        cmd_read(args, messages)
-    elif cmd == "/list":
-        cmd_list()
-    elif cmd in ("/new-project", "/newproject"):
-        cmd_new_project(args)
-    elif cmd == "/upgrades":
-        cmd_upgrades()
-    elif cmd in ("/quit", "/exit", "/q"):
-        console.print("[dim]Goodbye![/dim]")
-        sys.exit(0)
-    else:
-        return False  # not a slash command we recognise — let Claude handle it
+    handlers: dict[str, Any] = {
+        "/help": lambda: cmd_help(),
+        "/?": lambda: cmd_help(),
+        "/clear": lambda: (messages.clear(), console.print("[dim]History cleared.[/dim]")),
+        "/model": lambda: cmd_switch_model(args, messages),
+        "/models": lambda: cmd_models(),
+        "/rojo": lambda: cmd_rojo(),
+        "/list": lambda: cmd_rojo(),
+        "/save": lambda: cmd_save(args, messages),
+        "/read": lambda: cmd_read(args, messages),
+        "/deps": lambda: cmd_deps(),
+        "/watch": lambda: cmd_watch(args),
+        "/templates": lambda: cmd_templates(args),
+        "/template": lambda: cmd_template_insert(args),
+        "/cloud-info": lambda: cmd_cloud_info(),
+        "/cloud-read": lambda: cmd_cloud_read(args),
+        "/cloud-list": lambda: cmd_cloud_list(args),
+        "/new-project": lambda: cmd_new_project(args),
+        "/newproject": lambda: cmd_new_project(args),
+        "/autocommit": lambda: cmd_autocommit(args),
+        "/lint": lambda: cmd_lint_toggle(args),
+        "/upgrades": lambda: cmd_upgrades(),
+    }
 
-    return True
+    fn = handlers.get(cmd)
+    if fn:
+        fn()
+        return True
+    if cmd in ("/quit", "/exit", "/q"):
+        console.print("[dim]Goodbye![/dim]")
+        # Stop watcher if running
+        w = APP_STATE.get("watcher")
+        if w:
+            w.stop()
+        sys.exit(0)
+    return False
 
 
 # ─── Banner ───────────────────────────────────────────────────────────────────
 
 def print_banner() -> None:
+    backend: AIBackend | None = APP_STATE.get("backend")
     rojo: RojoProject | None = APP_STATE.get("rojo")
     rojo_line = (
         f"[success]Rojo:[/success] [cyan]{rojo.name}[/cyan] ({rojo.project_dir})"
         if rojo
-        else "[warning]Rojo: no project detected[/warning] (use /new-project to create one)"
+        else "[warning]Rojo: no project[/warning] — use /new-project to scaffold one"
     )
-    console.print(
-        Panel(
-            "[bold bright_red]Roblox AI Dev Tool[/bold bright_red]\n"
-            "[dim]Powered by Claude · Type [bold]/help[/bold] for commands · [bold]/quit[/bold] to exit[/dim]\n\n"
-            + rojo_line,
-            border_style="bright_red",
-        )
-    )
+    model_line = f"[success]Model:[/success] [cyan]{backend}[/cyan]" if backend else "[warning]No model configured[/warning]"
+    lint_line = "[success]Selene: installed[/success]" if selene_available() else "[dim]Selene: not installed (optional)[/dim]"
+    console.print(Panel(
+        "[bold bright_red]Roblox AI Dev Tool[/bold bright_red]\n"
+        "[dim]Type [bold]/help[/bold] for commands · [bold]/quit[/bold] to exit[/dim]\n\n"
+        + model_line + "\n" + rojo_line + "\n" + lint_line,
+        border_style="bright_red",
+    ))
 
 
 # ─── Main chat loop ───────────────────────────────────────────────────────────
 
-
-def chat(client: anthropic.Anthropic) -> None:
+def chat() -> None:
     messages: list[dict] = []
     print_banner()
 
@@ -838,145 +730,109 @@ def chat(client: anthropic.Anthropic) -> None:
             user_input = Prompt.ask("\n[bold cyan]You[/bold cyan]").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Goodbye![/dim]")
+            w = APP_STATE.get("watcher")
+            if w:
+                w.stop()
             break
 
         if not user_input:
             continue
-
         if user_input.startswith("/"):
             if handle_slash_command(user_input, messages):
                 continue
-            # Unrecognised slash command — fall through to Claude
 
         messages.append({"role": "user", "content": user_input})
+        backend: AIBackend = APP_STATE["backend"]
 
-        # ── Streaming tool-use loop ──────────────────────────────────────────
+        # ── streaming tool-use loop ──────────────────────────────────────────
         while True:
             console.print("\n[bold green]Claude[/bold green] ", end="")
 
             full_text = ""
             tool_calls: list[dict] = []
-            current_tool: dict | None = None
-            current_tool_json = ""
             stop_reason = "end_turn"
 
-            with client.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=8192,
-                thinking={"type": "adaptive"},
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=messages,
-            ) as stream:
-                for event in stream:
-                    if event.type == "content_block_start":
-                        blk = event.content_block
-                        if blk.type == "tool_use":
-                            if full_text:
-                                console.print()
-                            current_tool = {"id": blk.id, "name": blk.name}
-                            current_tool_json = ""
-                            console.print(f"\n[tool]⚙ Using tool: {blk.name}[/tool]")
-                        elif blk.type == "thinking":
-                            console.print("[dim][thinking...][/dim]", end="", soft_wrap=True)
+            try:
+                for event in backend.stream(messages=messages, system=SYSTEM_PROMPT, tools=TOOLS):
+                    if isinstance(event, TextDeltaEvent):
+                        console.print(event.text, end="", soft_wrap=True)
+                        full_text += event.text
+                    elif isinstance(event, ToolStartEvent):
+                        if full_text:
+                            console.print()
+                        console.print(f"\n[tool]⚙ Using tool: {event.tool_name}[/tool]")
+                    elif isinstance(event, ToolCompleteEvent):
+                        tool_calls.append({"id": event.tool_id, "name": event.tool_name, "input": event.tool_input})
+                    elif isinstance(event, StreamEndEvent):
+                        stop_reason = event.stop_reason
+            except Exception as exc:
+                console.print(f"\n[error]Stream error:[/error] {exc}")
+                break
 
-                    elif event.type == "content_block_delta":
-                        delta = event.delta
-                        if delta.type == "text_delta":
-                            console.print(delta.text, end="", soft_wrap=True)
-                            full_text += delta.text
-                        elif delta.type == "input_json_delta":
-                            current_tool_json += delta.partial_json
-
-                    elif event.type == "content_block_stop":
-                        if current_tool and current_tool_json:
-                            try:
-                                current_tool["input"] = json.loads(current_tool_json)
-                            except json.JSONDecodeError:
-                                current_tool["input"] = {}
-                            tool_calls.append(current_tool)
-                            current_tool = None
-                            current_tool_json = ""
-
-                    elif event.type == "message_delta":
-                        stop_reason = event.delta.stop_reason or "end_turn"
-
-                final_msg = stream.get_final_message()
-
-            if full_text and not tool_calls:
+            if full_text:
                 console.print()
 
-            messages.append({"role": "assistant", "content": final_msg.content})
+            # Store in Anthropic format (backend handles conversion internally)
+            messages.append({"role": "assistant", "content": backend.last_response_for_history()})
 
             if stop_reason != "tool_use" or not tool_calls:
                 break
 
+            # Execute tools and feed results back
             tool_results = []
             for tc in tool_calls:
-                result = execute_tool(tc["name"], tc.get("input", {}))
-                tool_results.append(
-                    {"type": "tool_result", "tool_use_id": tc["id"], "content": result}
-                )
-
+                result = execute_tool(tc["name"], tc["input"])
+                tool_results.append({"type": "tool_result", "tool_use_id": tc["id"], "content": result})
             messages.append({"role": "user", "content": tool_results})
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="roblox-dev-tool",
-        description="AI-powered Roblox game server development assistant",
-    )
-    parser.add_argument(
-        "--project",
-        metavar="DIR",
-        help="Path to an existing Rojo project directory",
-    )
-    parser.add_argument(
-        "--new-project",
-        metavar="NAME",
-        dest="new_project",
-        help="Scaffold a new Rojo project in the current directory with this name",
-    )
+    parser = argparse.ArgumentParser(prog="roblox-dev-tool", description="AI-powered Roblox game server assistant")
+    parser.add_argument("--model", default="", metavar="SPEC", help="Model spec, e.g. anthropic:claude-opus-4-6 or openai:gpt-4o")
+    parser.add_argument("--project", metavar="DIR", help="Rojo project directory")
+    parser.add_argument("--new-project", metavar="NAME", dest="new_project", help="Scaffold a new Rojo project")
     return parser.parse_args()
 
 
 def main() -> None:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        console.print(
-            "[error]Error:[/error] ANTHROPIC_API_KEY environment variable not set.\n"
-            "  [cyan]export ANTHROPIC_API_KEY=your-key-here[/cyan]"
-        )
-        sys.exit(1)
-
     args = parse_args()
 
-    # ── Rojo project initialisation ──────────────────────────────────────────
+    # ── Backend ──────────────────────────────────────────────────────────────
+    model_spec = args.model or os.environ.get("ROBLOX_AI_MODEL", "claude-opus-4-6")
+    try:
+        APP_STATE["backend"] = create_backend(model_spec)
+    except Exception as exc:
+        console.print(f"[error]Failed to create AI backend '{model_spec}':[/error] {exc}")
+        console.print("Ensure the appropriate API key env var is set. See /models for details.")
+        sys.exit(1)
+
+    # ── Rojo project ─────────────────────────────────────────────────────────
     if args.new_project:
         proj = RojoProject.create(os.getcwd(), args.new_project)
         APP_STATE["rojo"] = proj
-        console.print(
-            f"[success]✔ Created Rojo project:[/success] [cyan]{args.new_project}[/cyan]"
-        )
+        APP_STATE["git"] = GitManager(os.getcwd())
+        console.print(f"[success]✔ Created Rojo project:[/success] [cyan]{args.new_project}[/cyan]")
     elif args.project:
         proj = RojoProject(args.project)
         if proj.load():
             APP_STATE["rojo"] = proj
+            APP_STATE["git"] = GitManager(args.project)
         else:
-            console.print(
-                f"[error]No default.project.json found in:[/error] {args.project}"
-            )
+            console.print(f"[error]No default.project.json in:[/error] {args.project}")
             sys.exit(1)
     else:
         proj = RojoProject.find(os.getcwd())
         if proj:
             APP_STATE["rojo"] = proj
+            APP_STATE["git"] = GitManager(str(proj.project_dir))
 
-    client = anthropic.Anthropic(api_key=api_key)
-    chat(client)
+    # ── Open Cloud (optional) ─────────────────────────────────────────────────
+    if os.environ.get("ROBLOX_OPEN_CLOUD_KEY"):
+        APP_STATE["cloud"] = OpenCloudClient()
+
+    chat()
 
 
 if __name__ == "__main__":

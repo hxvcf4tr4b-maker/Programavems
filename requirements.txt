@@ -1,4 +1,22 @@
+# ── Core (required) ───────────────────────────────────────────────────────────
 anthropic>=0.40.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+httpx>=0.27.0
+
+# ── Multi-model providers (install whichever you use) ─────────────────────────
+# OpenAI, Groq, Mistral, OpenRouter, Ollama, Together, Fireworks, Perplexity
+# (all use the OpenAI-compatible SDK)
+openai>=1.40.0
+
+# Google Gemini
+google-generativeai>=0.7.0
+
+# ── File watching (for /watch mode) ───────────────────────────────────────────
+watchdog>=4.0.0
+
+# ── Git integration ───────────────────────────────────────────────────────────
+gitpython>=3.1.0
+
+# ── Build (optional — only needed to create an executable) ────────────────────
 pyinstaller>=6.0.0
