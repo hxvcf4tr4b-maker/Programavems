@@ -793,6 +793,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="", metavar="SPEC", help="Model spec, e.g. anthropic:claude-opus-4-6 or openai:gpt-4o")
     parser.add_argument("--project", metavar="DIR", help="Rojo project directory")
     parser.add_argument("--new-project", metavar="NAME", dest="new_project", help="Scaffold a new Rojo project")
+    parser.add_argument("--serve", action="store_true", help="Start Studio plugin HTTP bridge on port 8765")
+    parser.add_argument("--web", action="store_true", help="Start web UI server on port 8765")
+    parser.add_argument("--port", type=int, default=8765, help="Port for --serve / --web (default: 8765)")
     return parser.parse_args()
 
 
@@ -831,6 +834,16 @@ def main() -> None:
     # ── Open Cloud (optional) ─────────────────────────────────────────────────
     if os.environ.get("ROBLOX_OPEN_CLOUD_KEY"):
         APP_STATE["cloud"] = OpenCloudClient()
+
+    # ── Server modes ──────────────────────────────────────────────────────────
+    if args.web:
+        from web_server import run_server as run_web
+        run_web(port=args.port)
+        return
+    if args.serve:
+        from http_server import run_server as run_http
+        run_http(port=args.port)
+        return
 
     chat()
 

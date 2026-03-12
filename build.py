@@ -25,6 +25,36 @@ import subprocess
 import sys
 
 
+def build_web_ui() -> bool:
+    """Build the Next.js web UI into web/out/ — returns True on success."""
+    web_dir = os.path.join(os.path.dirname(__file__), "web")
+    if not os.path.exists(web_dir):
+        print("  web/ directory not found — skipping web UI build")
+        return False
+
+    node = shutil.which("node")
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if not node or not npm:
+        print("  Node.js / npm not found — skipping web UI build")
+        print("  Install from https://nodejs.org to include the web UI")
+        return False
+
+    print(f"  Node: {node}")
+    print(f"  npm:  {npm}")
+
+    print("  Installing web dependencies…")
+    subprocess.check_call([npm, "install", "--legacy-peer-deps"], cwd=web_dir)
+
+    print("  Building Next.js app…")
+    subprocess.check_call([npm, "run", "build"], cwd=web_dir)
+
+    out_dir = os.path.join(web_dir, "out")
+    if os.path.exists(out_dir):
+        print(f"  Web UI built → {out_dir}")
+        return True
+    return False
+
+
 def check_pyinstaller() -> None:
     try:
         import PyInstaller  # noqa: F401
@@ -33,8 +63,14 @@ def check_pyinstaller() -> None:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
 
 
-def build(onefile: bool = True, clean: bool = True) -> None:
+def build(onefile: bool = True, clean: bool = True, skip_web: bool = False) -> None:
     check_pyinstaller()
+
+    # Build the web UI first so PyInstaller can bundle it
+    if not skip_web:
+        print("\n── Building web UI ───────────────────────────────────────────────────────")
+        build_web_ui()
+        print()
 
     if clean:
         for d in ("build", "dist"):
@@ -72,6 +108,14 @@ def build(onefile: bool = True, clean: bool = True) -> None:
         if os.path.exists(src):
             cmd += ["--add-data", f"{src}{sep}."]
 
+    # Bundle web UI if built
+    web_out = os.path.join("web", "out")
+    if os.path.exists(web_out):
+        cmd += ["--add-data", f"{web_out}{sep}web/out"]
+        print(f"  Bundling web UI from {web_out}")
+    else:
+        print("  No web/out found — web UI will not be bundled")
+
     cmd += [
         "--hidden-import", "anthropic",
         "--hidden-import", "anthropic._streaming",
@@ -96,6 +140,7 @@ def build(onefile: bool = True, clean: bool = True) -> None:
     if system == "Windows" and os.path.exists("icon.ico"):
         cmd += ["--icon", "icon.ico"]
 
+    cmd += ["--add-data", f"web_server.py{sep}."]
     cmd.append("main.py")
 
     print("Running:", " ".join(cmd[:6]) + " …")
@@ -127,5 +172,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build roblox-dev-tool executable")
     parser.add_argument("--onedir", action="store_true", help="Folder build instead of single file")
     parser.add_argument("--no-clean", action="store_true", help="Skip cleaning dist/ and build/")
+    parser.add_argument("--no-web", action="store_true", help="Skip building the web UI")
     args = parser.parse_args()
-    build(onefile=not args.onedir, clean=not args.no_clean)
+    build(onefile=not args.onedir, clean=not args.no_clean, skip_web=args.no_web)

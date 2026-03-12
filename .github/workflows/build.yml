@@ -3,8 +3,8 @@ name: Build & Release .exe
 on:
   push:
     tags:
-      - "v*"          # trigger on version tags like v1.0.0
-  workflow_dispatch:  # allow manual runs from the Actions tab
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -19,11 +19,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package.json
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Build .exe
-        run: python build.py
+      - name: Build web UI (Next.js → static)
+        working-directory: web
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+
+      - name: Build .exe (bundles web UI)
+        run: python build.py --no-web
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -32,7 +45,6 @@ jobs:
           path: dist/roblox-dev-tool.exe
           retention-days: 30
 
-      # Only create a GitHub Release when triggered by a tag push
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
